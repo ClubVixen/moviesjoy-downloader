@@ -174,10 +174,118 @@ def stamp(url, token):
     return url + ("&" if "?" in url else "?") + "token=" + quote(token)
 
 
+# ---------------------------------------------------------------- gate (CST captcha)
+
+def _png_dims(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height",
+                        "-of", "csv=p=0", path], capture_output=True, text=True)
+    w, h = r.stdout.strip().split(",")
+    return int(w), int(h)
+
+
+def _png_raw(path):
+    out = path + ".raw"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+                    "-f", "rawvideo", "-pix_fmt", "rgba", out], check=True)
+    with open(out, "rb") as f:
+        return f.read()
+
+
+def _slide_answer(bg, bg_w, bg_h, piece, pw, ph, y, box):
+    """Find the gap by template-matching: the piece is the original pixels cut
+    from the background, and the gap shows them darkened. For each candidate
+    offset, fit a per-channel scale factor (the darkening) and minimize the
+    residual over the piece's opaque pixels. Scale-invariant => works on any
+    background brightness."""
+    pts = [(xx, yy) for yy in range(ph) for xx in range(pw) if piece[(yy * pw + xx) * 4 + 3] > 200]
+    if not pts:
+        pts = [(xx, yy) for yy in range(ph) for xx in range(pw) if piece[(yy * pw + xx) * 4 + 3] > 128]
+    if not pts:
+        return 0
+    pm = [piece[(yy * pw + xx) * 4: (yy * pw + xx) * 4 + 3] for xx, yy in pts]
+    pavg = [sum(p[i] for p in pm) / len(pm) for i in range(3)]
+    best_x, best_resid = 0, None
+    for x0 in range(0, bg_w - box + 1):
+        samples = []
+        for (xx, yy) in pts:
+            gx, gy = x0 + xx, y + yy
+            if gx >= bg_w or gy >= bg_h:
+                samples = None
+                break
+            i = (gy * bg_w + gx) * 4
+            samples.append((bg[i], bg[i + 1], bg[i + 2]))
+        if not samples:
+            continue
+        gavg = [sum(s[i] for s in samples) / len(samples) for i in range(3)]
+        k = [gavg[i] / pavg[i] if pavg[i] > 8 else 1.0 for i in range(3)]
+        resid = sum(abs(samples[n][i] - k[i] * pm[n][i])
+                    for n in range(len(samples)) for i in range(3)) / (len(samples) * 3)
+        if best_resid is None or resid < best_resid:
+            best_resid, best_x = resid, x0
+    return best_x
+
+
+def solve_cst_gate(session, config, player_url, log=log_default, max_attempts=5):
+    """Solve the site's self-hosted slide captcha (shown when the IP is rate-
+    limited) and return a freshly minted stream apiToken."""
+    api = urljoin(player_url, config.get("cstApi") or "/vs_captcha/public/api.php")
+    verify_url = urljoin(player_url, config.get("cstVerify") or "/embed/verify_cst.php")
+    gate_ticket = config.get("gateTicket") or ""
+    tmp = tempfile.mkdtemp(prefix="mjgate_")
+    try:
+        attempt = 0
+        while attempt < max_attempts:
+            r = session.get(api, params={"action": "create", "type": "slide",
+                                         "_": int(time.time() * 1000)},
+                            headers={"Referer": player_url}, timeout=30)
+            c = r.json()
+            if c.get("locked"):
+                wait = min(int(c.get("retry_after") or 5), 60)
+                log(f"  gate: locked, waiting {wait}s")
+                time.sleep(wait)
+                continue  # a lock does not consume an attempt
+            attempt += 1
+            w, box, y = int(c["width"]), int(c["box"]), int(c["y"])
+            paths = {}
+            for part in ("bg", "piece"):
+                p = os.path.join(tmp, f"{attempt}_{part}.png")
+                with open(p, "wb") as f:
+                    f.write(session.get(urljoin(api, c[part]),
+                                        headers={"Referer": player_url}, timeout=30).content)
+                paths[part] = p
+            pw, ph = _png_dims(paths["piece"])
+            bw, bh = _png_dims(paths["bg"])
+            guess = _slide_answer(_png_raw(paths["bg"]), bw, bh,
+                                  _png_raw(paths["piece"]), pw, ph, y, box)
+            log(f"  gate: slide puzzle #{attempt}, trying offset {guess}")
+            vr = session.post(api, params={"action": "verify"},
+                              data={"id": c["id"], "value": f"{guess:.2f}",
+                                    "duration": "1500"},
+                              headers={"Referer": player_url}, timeout=30).json()
+            if not vr.get("success"):
+                log("  gate: not quite, fetching a fresh puzzle")
+                continue
+            j = session.post(verify_url,
+                             data={"captcha": "cst", "token": vr.get("token", ""),
+                                   "gate_ticket": gate_ticket},
+                             headers={"Referer": player_url}, timeout=30).json()
+            if j.get("success") and j.get("apiToken"):
+                log("  gate: solved, fresh stream token minted")
+                return j["apiToken"]
+            if j.get("rateLimited"):
+                raise RuntimeError("still rate-limited after solving the gate; try again later")
+            log(f"  gate: verify failed ({json.dumps(j)[:120]})")
+        raise RuntimeError("could not solve the verification gate")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- high level
 
 def prepare_movie(session, target, source=0, log=log_default):
-    """Run the full token chain and enumerate qualities. Returns a prep dict."""
+    """Run the full token chain and enumerate qualities. Returns a prep dict.
+    If the site's verification gate is active (rate-limited IP), the slide
+    captcha is solved automatically and the chain retried with a fresh token."""
     tmdb_id, page_url = resolve_target(session, target)
     log(f"Resolved TMDB id {tmdb_id}")
     embed_url = get_vs_embed_url(session, tmdb_id)
@@ -188,17 +296,36 @@ def prepare_movie(session, target, source=0, log=log_default):
     title = data.get("title") or f"movie-{tmdb_id}"
     pool_host = data.get("stream_urls_api_host")
 
-    api_url = config["api"]
-    if "api_token=" not in api_url:
-        api_url += ("&" if "?" in api_url else "?") + "api_token=" + quote(config["apiToken"])
-    if pool_host:
-        api_url = urlparse(api_url)._replace(netloc=pool_host).geturl()
+    def stream_api_url(token):
+        u = config["api"]
+        if "api_token=" not in u:
+            u += ("&" if "?" in u else "?") + "api_token=" + quote(token or "")
+        if pool_host:
+            u = urlparse(u)._replace(netloc=pool_host).geturl()
+        return u
 
-    env = session.get(api_url, headers={"Referer": player_url}, timeout=30).json()
-    enc = env.get("data", {}).get("stream_urls")
+    def fetch_envelope():
+        r = session.get(stream_api_url(config.get("apiToken")),
+                        headers={"Referer": player_url}, timeout=30)
+        try:
+            return r.json()
+        except Exception:
+            raise RuntimeError(f"stream API returned non-JSON (HTTP {r.status_code})")
+
+    env = fetch_envelope()
+    enc = (env.get("data") or {}).get("stream_urls")
     vs = env.get("vs") or {}
     if not isinstance(enc, str) or not vs:
-        raise RuntimeError("Stream envelope did not contain encrypted stream_urls.")
+        detail = str(env.get("error") or env.get("status_code") or "no stream_urls in response")
+        if config.get("cstCaptcha") and config.get("gateTicket"):
+            log(f"Verification gate active ({detail}) - solving it")
+            config["apiToken"] = solve_cst_gate(session, config, player_url, log=log)
+            env = fetch_envelope()
+            enc = (env.get("data") or {}).get("stream_urls")
+            vs = env.get("vs") or {}
+    if not isinstance(enc, str) or not vs:
+        detail = str(env.get("error") or env.get("status_code") or "no stream_urls in response")
+        raise RuntimeError(f"stream API said: {detail}")
     wasm = (requests.get(vs["wasm_url"], timeout=30).content if vs.get("wasm_url")
             else base64.b64decode(vs["wasm"]))
     playlists = decrypt_stream_urls(wasm, enc)

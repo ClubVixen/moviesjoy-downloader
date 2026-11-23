@@ -94,6 +94,11 @@ python moviesjoy_dl.py <url> --limit 10          # quick 10-segment test run
 - `queue.json` (your personal queue state) is git-ignored and never committed.
 - If a stream's access token expires mid-download, the app re-requests it
   automatically.
+- If the site shows its occasional human-verification gate (for example after
+  a lot of activity from one address), the app solves the site's own slider
+  puzzle automatically and carries on.
+- Items that fail are retried automatically up to two more times; you can also
+  re-queue them at any time with the **Retry failed** button.
 
 ## License
 

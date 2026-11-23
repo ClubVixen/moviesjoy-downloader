@@ -13,6 +13,7 @@ import queue as pyqueue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -164,6 +165,7 @@ class App:
         ttk.Label(qhead, text="Queue").pack(side="left")
         ttk.Button(qhead, text="Remove selected", command=self._remove_selected).pack(side="right")
         ttk.Button(qhead, text="Clear finished", command=self._clear_finished).pack(side="right", padx=6)
+        ttk.Button(qhead, text="Retry failed", command=self._retry_failed).pack(side="right")
 
         self.queue_list = tk.Listbox(self.root, bg=PANEL, fg=FG, relief="flat",
                                      selectbackground="#3a3a55", selectforeground=FG,
@@ -322,6 +324,19 @@ class App:
         self.evq.put(("redraw", None))
         self._save_queue()
 
+    def _retry_failed(self):
+        n = 0
+        with self.lock:
+            for it in self.items:
+                if it.get("status") == FAILED:
+                    it["status"] = PENDING
+                    it["pct"] = 0
+                    n += 1
+        self.evq.put(("redraw", None))
+        self._save_queue()
+        if n:
+            self._log(f"Re-queued {n} failed item(s). Hit Start if the queue isn't running.")
+
     def _start_queue(self):
         if self.workers_active:
             return
@@ -365,40 +380,63 @@ class App:
     def _download_item(self, idx):
         with self.lock:
             target = self.items[idx]["target"]
-        cancel = threading.Event()
-        self.cancel_events[idx] = cancel
-        session = core.make_session()
-        self._setitem(idx, status=PREPARING)
-        try:
-            prep = core.prepare_movie(session, target, log=self._log)
-            self._setitem(idx, status=DOWNLOADING, title=prep["title"], pct=0)
-            outdir = self.outdir_var.get().strip() or os.path.join(os.path.expanduser("~"), "Videos")
+        max_retries = 2
+        attempt = 0
+        prep_title = None
+        last_err = "unknown error"
+        while attempt <= max_retries:
+            if self.stop_all.is_set():
+                break
+            cancel = threading.Event()
+            self.cancel_events[idx] = cancel
+            session = core.make_session()
+            self._setitem(idx, status=PREPARING)
+            res = None
+            try:
+                prep = core.prepare_movie(session, target, log=self._log)
+                prep_title = prep["title"]
+                self._setitem(idx, status=DOWNLOADING, title=prep["title"], pct=0)
+                outdir = self.outdir_var.get().strip() or os.path.join(os.path.expanduser("~"), "Videos")
 
-            def progress(done, total, nbytes):
-                pct = int(done * 100 / max(total, 1))
-                self._setitem(idx, pct=pct, mb=int(nbytes / 1e6))
-                self.evq.put(("progress", (prep["title"], pct, done, total)))
+                def progress(done, total, nbytes):
+                    pct = int(done * 100 / max(total, 1))
+                    self._setitem(idx, pct=pct, mb=int(nbytes / 1e6))
+                    self.evq.put(("progress", (prep["title"], pct, done, total)))
 
-            res = core.download_movie(
-                session, prep, quality=self.quality_var.get(), out=outdir,
-                workers=max(2, int(self.workers_var.get())), log=self._log,
-                progress=progress, cancel=cancel)
-            if res["status"] == "done":
+                res = core.download_movie(
+                    session, prep, quality=self.quality_var.get(), out=outdir,
+                    workers=max(2, int(self.workers_var.get())), log=self._log,
+                    progress=progress, cancel=cancel)
+            except Exception as e:
+                res = {"status": "error", "error": str(e)}
+            finally:
+                self.cancel_events.pop(idx, None)
+
+            if res and res["status"] == "done":
                 mb = int(os.path.getsize(res["path"]) / 1e6)
                 self._setitem(idx, status=DONE, pct=100, path=res["path"], mb=mb)
-                self._log(f"\u2713 {prep['title']} finished -> {res['path']}")
-            elif res["status"] == "canceled":
+                self._log(f"\u2713 {prep_title} finished -> {res['path']}")
+                self._save_queue()
+                return
+            if res and res["status"] == "canceled":
                 self._setitem(idx, status=CANCELED)
-                self._log(f"- {prep['title']} canceled.")
+                self._log(f"- {prep_title or target} canceled.")
+                self._save_queue()
+                return
+            last_err = (res or {}).get("error") or "unknown error"
+            attempt += 1
+            if attempt <= max_retries and not self.stop_all.is_set() and not cancel.is_set():
+                self._log(f"\u00d7 {prep_title or target}: {last_err} \u2014 retrying in 15s "
+                          f"(retry {attempt}/{max_retries})")
+                for _ in range(15):
+                    if self.stop_all.is_set() or cancel.is_set():
+                        break
+                    time.sleep(1)
             else:
-                self._setitem(idx, status=FAILED)
-                self._log(f"\u00d7 {prep['title']} failed: {res.get('error')}")
-        except Exception as e:
-            self._setitem(idx, status=FAILED)
-            self._log(f"\u00d7 failed: {e}")
-        finally:
-            self.cancel_events.pop(idx, None)
-            self._save_queue()
+                break
+        self._setitem(idx, status=FAILED)
+        self._log(f"\u00d7 {prep_title or target} failed after {attempt} attempt(s): {last_err}")
+        self._save_queue()
 
     # ---------------------------------------------------------------- event poll
     def _poll(self):
