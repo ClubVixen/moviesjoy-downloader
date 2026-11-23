@@ -1,0 +1,12 @@
+# user-local state
+queue.json
+dl.log
+
+# python
+__pycache__/
+*.pyc
+
+# output / test files
+*.mp4
+*.ts
+*.mkv
